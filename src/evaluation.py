@@ -1,108 +1,97 @@
+"""Evaluation utilities for entity matching."""
 from __future__ import annotations
+import csv
+from pathlib import Path
+from typing import Iterable, Mapping
 
-import numpy as np
-import pandas as pd
-
-
-def precision_recall_f05(
-    predicted: set[str],
-    actual: set[str],
-    beta: float = 0.5,
-) -> tuple[float, float, float]:
-    tp = len(predicted & actual)
-    fp = len(predicted - actual)
-    fn = len(actual - predicted)
-
-    precision = tp / (tp + fp) if (tp + fp) else (1.0 if not actual else 0.0)
-    recall = tp / (tp + fn) if (tp + fn) else 1.0
-
-    beta2 = beta * beta
-    denom = beta2 * precision + recall
-    f_beta = ((1 + beta2) * precision * recall / denom) if denom else 0.0
-    return precision, recall, f_beta
+MatchSets = Mapping[str, Iterable[str]]
 
 
-def macro_f05(
-    predicted_by_s1: dict[str, set[str]],
-    actual_by_s1: dict[str, set[str]],
-    beta: float = 0.5,
-) -> float:
-    scores = []
-    for s1_id, actual in actual_by_s1.items():
-        predicted = predicted_by_s1.get(s1_id, set())
-        _, _, f = precision_recall_f05(predicted, actual, beta)
-        scores.append(f)
-    return float(np.mean(scores)) if scores else 0.0
+def parse_ground_truth(path: str | Path) -> dict[str, set[str]]:
+    """Parse train_ground_truth.tsv into S1 -> set(true matched IDs)."""
+    path = Path(path)
+    ground_truth: dict[str, set[str]] = {}
+    with path.open("r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file, delimiter="\t")
+        required = {"source1_entity_id", "matched_entity_ids"}
+        if not required.issubset(reader.fieldnames or set()):
+            raise ValueError(
+                "Ground-truth TSV must contain columns "
+                "'source1_entity_id' and 'matched_entity_ids'."
+            )
+        for row in reader:
+            s1 = (row["source1_entity_id"] or "").strip()
+            if not s1:
+                raise ValueError("Encountered a ground-truth row with an empty S1 ID.")
+            raw = (row["matched_entity_ids"] or "").strip()
+            ground_truth[s1] = {x.strip() for x in raw.split(",") if x.strip()}
+    return ground_truth
 
 
-def candidate_recall(
-    candidate_by_s1: dict[str, set[str]],
-    actual_by_s1: dict[str, set[str]],
-) -> float:
-    total = 0
-    found = 0
-    for s1_id, actual in actual_by_s1.items():
-        total += len(actual)
-        found += len(candidate_by_s1.get(s1_id, set()) & actual)
-    return found / total if total else 1.0
+def _safe_divide(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
 
 
-def parse_ground_truth(df: pd.DataFrame) -> dict[str, set[str]]:
-    """Convert the official comma-separated target column into sets."""
-    out: dict[str, set[str]] = {}
-    for s1_id, value in zip(
-        df["source1_entity_id"].astype(str),
-        df["matched_entity_ids"].fillna("").astype(str),
-        strict=False,
-    ):
-        ids = {x.strip() for x in value.split(",") if x.strip()}
-        out[s1_id] = ids
-    return out
+def _f_beta(precision: float, recall: float, beta: float) -> float:
+    if beta <= 0:
+        raise ValueError("beta must be greater than 0.")
+    denominator = beta**2 * precision + recall
+    if denominator == 0:
+        return 0.0
+    return (1 + beta**2) * precision * recall / denominator
 
 
-def predictions_from_scores(
-    score_df: pd.DataFrame,
-    threshold: float,
+def evaluate(
+    ground_truth: MatchSets,
+    predictions: MatchSets,
     *,
-    s1_col: str = "source1_entity_id",
-    candidate_col: str = "candidate_entity_id",
-    score_col: str = "match_probability",
-) -> dict[str, set[str]]:
-    grouped: dict[str, set[str]] = {}
-    for s1_id, group in score_df.groupby(s1_col, sort=False):
-        grouped[str(s1_id)] = set(
-            group.loc[group[score_col] >= threshold, candidate_col].astype(str)
-        )
-    return grouped
+    beta: float = 0.5,
+) -> dict[str, object]:
+    """Return per-S1 TP/FP/FN/P/R/F0.5 plus macro metrics.
+
+    S1 IDs appearing on either side are evaluated; a missing side is treated
+    as an empty set. Undefined precision/recall cases use 0.0.
+    """
+    if beta <= 0:
+        raise ValueError("beta must be greater than 0.")
+
+    truth = {s1: set(matches) for s1, matches in ground_truth.items()}
+    predicted = {s1: set(matches) for s1, matches in predictions.items()}
+    all_s1 = set(truth) | set(predicted)
+    per_s1: dict[str, dict[str, float | int]] = {}
+
+    for s1 in sorted(all_s1):
+        true_matches = truth.get(s1, set())
+        predicted_matches = predicted.get(s1, set())
+        tp = len(true_matches & predicted_matches)
+        fp = len(predicted_matches - true_matches)
+        fn = len(true_matches - predicted_matches)
+        precision = _safe_divide(tp, tp + fp)
+        recall = _safe_divide(tp, tp + fn)
+        per_s1[s1] = {
+            "TP": tp,
+            "FP": fp,
+            "FN": fn,
+            "Precision": precision,
+            "Recall": recall,
+            "F0.5": _f_beta(precision, recall, beta),
+        }
+
+    if per_s1:
+        macro_precision = sum(x["Precision"] for x in per_s1.values()) / len(per_s1)
+        macro_recall = sum(x["Recall"] for x in per_s1.values()) / len(per_s1)
+        macro_f = sum(x["F0.5"] for x in per_s1.values()) / len(per_s1)
+    else:
+        macro_precision = macro_recall = macro_f = 0.0
+
+    return {
+        "per_s1": per_s1,
+        "macro_precision": macro_precision,
+        "macro_recall": macro_recall,
+        "macro_f0.5": macro_f,
+    }
 
 
-def threshold_sweep(
-    score_df: pd.DataFrame,
-    actual_by_s1: dict[str, set[str]],
-    thresholds: list[float] | None = None,
-) -> pd.DataFrame:
-    if thresholds is None:
-        thresholds = [round(x, 3) for x in np.arange(0.10, 0.951, 0.01)]
-
-    rows = []
-    for threshold in thresholds:
-        pred = predictions_from_scores(score_df, threshold)
-        f = macro_f05(pred, actual_by_s1)
-        # Global pair precision/recall are supplementary diagnostics.
-        tp = fp = fn = 0
-        for s1_id, actual in actual_by_s1.items():
-            p = pred.get(s1_id, set())
-            tp += len(p & actual)
-            fp += len(p - actual)
-            fn += len(actual - p)
-        precision = tp / (tp + fp) if tp + fp else 1.0
-        recall = tp / (tp + fn) if tp + fn else 1.0
-        rows.append(
-            {
-                "threshold": threshold,
-                "macro_f05": f,
-                "global_precision": precision,
-                "global_recall": recall,
-            }
-        )
-    return pd.DataFrame(rows).sort_values("threshold").reset_index(drop=True)
+def evaluate_from_file(path: str | Path, predictions: MatchSets) -> dict[str, object]:
+    """Parse ground truth from a TSV and evaluate predictions."""
+    return evaluate(parse_ground_truth(path), predictions)
