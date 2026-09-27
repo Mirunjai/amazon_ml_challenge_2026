@@ -128,7 +128,7 @@ def test_full_ml_side_wiring():
     from src.evaluation import candidate_recall
 
     candidate_by_s1 = group_pairs_by_s1(long_pairs)
-    recall = candidate_recall(candidate_by_s1, gt_map)
+    recall = candidate_recall(gt_map, candidate_by_s1)
     assert recall == 1.0  # by construction every true match was included as a candidate
 
     # 2. Pairwise features via the existing, already-tested feature module.

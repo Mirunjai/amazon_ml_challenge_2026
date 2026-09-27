@@ -27,4 +27,4 @@ def test_ground_truth_parser():
 def test_macro_f05_empty_singleton():
     actual = {"S1-1": set(), "S1-2": {"S2-1"}}
     pred = {"S1-1": set(), "S1-2": {"S2-1"}}
-    assert macro_f05(pred, actual) == 1.0
+    assert macro_f05(actual, pred) == 1.0
